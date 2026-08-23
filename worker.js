@@ -2,16 +2,12 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // ---------------------------------------------------------
-    // CORS / basic response headers
-    // ---------------------------------------------------------
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type, Authorization"
     };
 
-    // Handle browser preflight requests
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -19,33 +15,22 @@ export default {
       });
     }
 
-    // ---------------------------------------------------------
-    // Health check
-    // GET /health
-    // ---------------------------------------------------------
     if (request.method === "GET" && url.pathname === "/health") {
       return json(
         {
           service: "trackora-push",
           status: "online",
-          version: "1.0.0"
+          version: "2.0.0"
         },
         200,
         corsHeaders
       );
     }
 
-    // ---------------------------------------------------------
-    // Push gateway
-    // POST /push
-    // ---------------------------------------------------------
     if (request.method === "POST" && url.pathname === "/push") {
       return handlePush(request, env, corsHeaders);
     }
 
-    // ---------------------------------------------------------
-    // Unknown route
-    // ---------------------------------------------------------
     return json(
       {
         error: "Not Found",
@@ -58,13 +43,11 @@ export default {
 };
 
 
-// =============================================================
+// ============================================================
 // PUSH HANDLER
-// =============================================================
+// ============================================================
 
 async function handlePush(request, env, corsHeaders) {
-  // Server-side secret.
-  // Configure this later as a Cloudflare Worker Secret.
   const expectedSecret = env.TRACKORA_PUSH_SECRET;
 
   if (!expectedSecret) {
@@ -76,10 +59,6 @@ async function handlePush(request, env, corsHeaders) {
       corsHeaders
     );
   }
-
-  // -----------------------------------------------------------
-  // Authorization
-  // -----------------------------------------------------------
 
   const authorization = request.headers.get("Authorization");
 
@@ -93,10 +72,6 @@ async function handlePush(request, env, corsHeaders) {
     );
   }
 
-  // -----------------------------------------------------------
-  // Content-Type validation
-  // -----------------------------------------------------------
-
   const contentType = request.headers.get("Content-Type") || "";
 
   if (!contentType.toLowerCase().includes("application/json")) {
@@ -108,10 +83,6 @@ async function handlePush(request, env, corsHeaders) {
       corsHeaders
     );
   }
-
-  // -----------------------------------------------------------
-  // Parse JSON
-  // -----------------------------------------------------------
 
   let body;
 
@@ -127,20 +98,12 @@ async function handlePush(request, env, corsHeaders) {
     );
   }
 
-  // -----------------------------------------------------------
-  // Extract payload
-  // -----------------------------------------------------------
-
   const {
     token,
     title,
     message,
     data
   } = body || {};
-
-  // -----------------------------------------------------------
-  // Validate FCM token
-  // -----------------------------------------------------------
 
   if (
     typeof token !== "string" ||
@@ -154,10 +117,6 @@ async function handlePush(request, env, corsHeaders) {
       corsHeaders
     );
   }
-
-  // -----------------------------------------------------------
-  // Validate title
-  // -----------------------------------------------------------
 
   if (
     typeof title !== "string" ||
@@ -173,10 +132,6 @@ async function handlePush(request, env, corsHeaders) {
     );
   }
 
-  // -----------------------------------------------------------
-  // Validate message
-  // -----------------------------------------------------------
-
   if (
     typeof message !== "string" ||
     message.trim().length < 1 ||
@@ -190,10 +145,6 @@ async function handlePush(request, env, corsHeaders) {
       corsHeaders
     );
   }
-
-  // -----------------------------------------------------------
-  // Validate optional data
-  // -----------------------------------------------------------
 
   if (
     data !== undefined &&
@@ -209,35 +160,300 @@ async function handlePush(request, env, corsHeaders) {
     );
   }
 
-  // -----------------------------------------------------------
-  // Firebase sender is intentionally NOT implemented yet.
-  //
-  // Firebase Admin credentials must never be placed inside
-  // frontend code or GitHub. They will be configured later
-  // as protected Cloudflare Worker Secrets.
-  // -----------------------------------------------------------
+  const projectId = env.FIREBASE_PROJECT_ID;
+  const clientEmail = env.FIREBASE_CLIENT_EMAIL;
+  const privateKey = env.FIREBASE_PRIVATE_KEY;
 
-  const firebaseConfigured =
-    Boolean(env.FIREBASE_PROJECT_ID) &&
-    Boolean(env.FIREBASE_CLIENT_EMAIL) &&
-    Boolean(env.FIREBASE_PRIVATE_KEY);
+  if (!projectId || !clientEmail || !privateKey) {
+    return json(
+      {
+        error: "Firebase server credentials are not configured"
+      },
+      503,
+      corsHeaders
+    );
+  }
 
-  return json(
-    {
-      accepted: true,
-      service: "trackora-push",
-      message: "Push request validated successfully",
-      fcmConfigured: firebaseConfigured
-    },
-    200,
-    corsHeaders
-  );
+  try {
+    const accessToken = await createGoogleAccessToken(
+      clientEmail,
+      privateKey
+    );
+
+    const fcmUrl =
+      `https://fcm.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/messages:send`;
+
+    const fcmPayload = {
+      message: {
+        token: token.trim(),
+
+        notification: {
+          title: title.trim(),
+          body: message.trim()
+        },
+
+        data: normalizeData(data),
+
+        webpush: {
+          notification: {
+            title: title.trim(),
+            body: message.trim(),
+            icon: "/favicon.ico"
+          }
+        }
+      }
+    };
+
+    const response = await fetch(fcmUrl, {
+      method: "POST",
+
+      headers: {
+        "Authorization": `Bearer ${accessToken}`,
+        "Content-Type": "application/json"
+      },
+
+      body: JSON.stringify(fcmPayload)
+    });
+
+    const responseText = await response.text();
+
+    let responseData;
+
+    try {
+      responseData = JSON.parse(responseText);
+    } catch {
+      responseData = {
+        raw: responseText
+      };
+    }
+
+    if (!response.ok) {
+      return json(
+        {
+          error: "FCM request failed",
+          status: response.status,
+          details: responseData
+        },
+        502,
+        corsHeaders
+      );
+    }
+
+    return json(
+      {
+        accepted: true,
+        sent: true,
+        service: "trackora-push",
+        fcmMessageId:
+          responseData?.name || null
+      },
+      200,
+      corsHeaders
+    );
+
+  } catch (error) {
+    return json(
+      {
+        error: "FCM delivery failed",
+        details: error instanceof Error
+          ? error.message
+          : "Unknown error"
+      },
+      502,
+      corsHeaders
+    );
+  }
 }
 
 
-// =============================================================
-// JSON RESPONSE HELPER
-// =============================================================
+// ============================================================
+// GOOGLE OAUTH 2.0
+// ============================================================
+
+async function createGoogleAccessToken(
+  clientEmail,
+  privateKey
+) {
+  const now = Math.floor(Date.now() / 1000);
+
+  const header = {
+    alg: "RS256",
+    typ: "JWT"
+  };
+
+  const payload = {
+    iss: clientEmail,
+    scope: "https://www.googleapis.com/auth/firebase.messaging",
+    aud: "https://oauth2.googleapis.com/token",
+    iat: now,
+    exp: now + 3600
+  };
+
+  const encodedHeader = base64UrlEncode(
+    JSON.stringify(header)
+  );
+
+  const encodedPayload = base64UrlEncode(
+    JSON.stringify(payload)
+  );
+
+  const unsignedToken =
+    `${encodedHeader}.${encodedPayload}`;
+
+  const normalizedKey = privateKey
+    .replace(/\\n/g, "\n")
+    .trim();
+
+  const keyData = pemToArrayBuffer(normalizedKey);
+
+  const cryptoKey = await crypto.subtle.importKey(
+    "pkcs8",
+    keyData,
+    {
+      name: "RSASSA-PKCS1-v1_5",
+      hash: "SHA-256"
+    },
+    false,
+    ["sign"]
+  );
+
+  const signature = await crypto.subtle.sign(
+    "RSASSA-PKCS1-v1_5",
+    cryptoKey,
+    new TextEncoder().encode(unsignedToken)
+  );
+
+  const signedJwt =
+    `${unsignedToken}.${base64UrlEncodeBytes(signature)}`;
+
+  const tokenResponse = await fetch(
+    "https://oauth2.googleapis.com/token",
+    {
+      method: "POST",
+
+      headers: {
+        "Content-Type":
+          "application/x-www-form-urlencoded"
+      },
+
+      body:
+        `grant_type=${encodeURIComponent(
+          "urn:ietf:params:oauth:grant-type:jwt-bearer"
+        )}` +
+        `&assertion=${encodeURIComponent(signedJwt)}`
+    }
+  );
+
+  const tokenText = await tokenResponse.text();
+
+  let tokenData;
+
+  try {
+    tokenData = JSON.parse(tokenText);
+  } catch {
+    throw new Error(
+      "Google OAuth returned an invalid response"
+    );
+  }
+
+  if (
+    !tokenResponse.ok ||
+    typeof tokenData.access_token !== "string"
+  ) {
+    throw new Error(
+      tokenData.error_description ||
+      tokenData.error ||
+      "Unable to obtain Google access token"
+    );
+  }
+
+  return tokenData.access_token;
+}
+
+
+// ============================================================
+// DATA NORMALIZATION
+// ============================================================
+
+function normalizeData(data) {
+  if (!data || typeof data !== "object") {
+    return {};
+  }
+
+  const result = {};
+
+  for (const [key, value] of Object.entries(data)) {
+    if (value === undefined || value === null) {
+      continue;
+    }
+
+    result[String(key)] = String(value);
+  }
+
+  return result;
+}
+
+
+// ============================================================
+// BASE64URL HELPERS
+// ============================================================
+
+function base64UrlEncode(value) {
+  return base64UrlEncodeBytes(
+    new TextEncoder().encode(value)
+  );
+}
+
+function base64UrlEncodeBytes(bytes) {
+  let binary = "";
+
+  const chunkSize = 0x8000;
+
+  for (
+    let i = 0;
+    i < bytes.length;
+    i += chunkSize
+  ) {
+    binary += String.fromCharCode(
+      ...bytes.subarray(
+        i,
+        Math.min(i + chunkSize, bytes.length)
+      )
+    );
+  }
+
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+
+// ============================================================
+// PEM → ARRAY BUFFER
+// ============================================================
+
+function pemToArrayBuffer(pem) {
+  const base64 = pem
+    .replace("-----BEGIN PRIVATE KEY-----", "")
+    .replace("-----END PRIVATE KEY-----", "")
+    .replace(/\s+/g, "");
+
+  const binary = atob(base64);
+
+  const bytes = new Uint8Array(binary.length);
+
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+
+  return bytes.buffer;
+}
+
+
+// ============================================================
+// JSON RESPONSE
+// ============================================================
 
 function json(data, status = 200, extraHeaders = {}) {
   return new Response(
@@ -245,8 +461,12 @@ function json(data, status = 200, extraHeaders = {}) {
     {
       status,
       headers: {
-        "Content-Type": "application/json; charset=utf-8",
-        "Cache-Control": "no-store",
+        "Content-Type":
+          "application/json; charset=utf-8",
+
+        "Cache-Control":
+          "no-store",
+
         ...extraHeaders
       }
     }
